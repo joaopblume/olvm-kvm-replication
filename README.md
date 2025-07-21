@@ -1,320 +1,384 @@
-# Sistema de Backup e Recuperação de Desastres oVirt/OLVM
+# oVirt/OLVM Backup and Disaster Recovery System
 
-Solução automatizada de backup e recuperação de desastres para ambientes de virtualização oVirt/OLVM usando Apache Airflow. Este sistema oferece backup automatizado de VMs, restauração e gerenciamento de certificados com suporte para backups incrementais.
+Automated backup and disaster recovery solution for oVirt/OLVM virtualization environments using Apache Airflow. This system provides automated VM backup, restore, and certificate management for oVirt virtualization environments.
 
-## Pré-requisitos
+## Architecture
 
-- **Docker e Docker Compose** (única dependência necessária)
-- **VM no Ambiente DR**: Sistema deve rodar dentro de uma VM no cluster DR
-- **Disco de Backup Separado**: Disco dedicado para armazenamento de backup (1TB+ recomendado)
-- **Acesso de Rede**: VM deve alcançar ambos os gerenciadores oVirt (Produção e DR)
+The system operates with two oVirt environments:
+- **Production**: Source environment for backups (e.g., `manager.local`)
+- **Disaster Recovery (DR)**: Target environment for restores (e.g., `dr-manager.local`)
 
-## Arquitetura
+### Key Components
+- **Dynamic DAG Generation**: Template-based DAG creation using Jinja2
+- **oVirt SDK Integration**: Direct API calls to oVirt engines
+- **QCOW2 Processing**: Incremental backup chains with optimized qemu-img merging
+- **Certificate Management**: SSL cert handling for oVirt connections
+- **Checkpoint Management**: Backup chain tracking and validation
 
-O sistema opera com dois ambientes oVirt:
-- **Produção**: Ambiente de origem para backups
-- **Recuperação de Desastres (DR)**: Ambiente de destino para restaurações
+## Prerequisites
 
-### Componentes Principais
-- **DAGs do Airflow**: Orquestram workflows de backup/restore
-- **Integração SDK oVirt**: Chamadas diretas da API para engines oVirt
-- **Processamento QCOW2**: Cadeias de backup incremental com qemu-img
-- **Gerenciamento de Certificados**: Manuseio de certificados SSL para conexões oVirt
+- **Docker and Docker Compose** (only dependency required)
+- **VM in DR Environment**: System must run inside a VM in the DR cluster
+- **Separate Backup Disk**: Dedicated disk for backup storage (1TB+ recommended)
+- **Network Access**: VM must reach both oVirt managers (Production and DR)
 
-## Instalação
+## Installation
 
-### 1. Configuração Inicial da VM
+### 1. Initial VM Setup
 
 ```bash
-# Clonar repositório
-git clone <url-do-repositorio>
-cd replicacao-olvm
+# Clone repository
+git clone <repository-url>
+cd replicacao-olvm-joao
 
-# Montar disco de backup (exemplo com /dev/sdc)
+# Mount backup disk (example with /dev/sdc)
 sudo mkfs.ext4 /dev/sdc
 sudo mkdir -p /backup
 sudo mount /dev/sdc /backup
+sudo chown -R 50000:50000 /backup  # IMPORTANT: Use Airflow UID 50000
 
-# Adicionar ao fstab para persistência
+# Add to fstab for persistence
 echo "/dev/sdc /backup ext4 defaults 0 2" | sudo tee -a /etc/fstab
-
-# Definir permissões corretas para diretório de backup
-sudo chown -R 50000:50000 /backup
 ```
 
-### 2. Configuração de Ambiente
+### 2. Environment Configuration
 
-Copie e edite o arquivo de ambiente:
-```bash
-cp .env_example .env
-```
+Configure your environment variables:
 
-Edite `.env` com seus valores:
 ```bash
-# Configuração do Airflow
-FERNET_KEY=sua-chave-fernet-aqui          # Gerar com: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-JWT_SECRET=seu-jwt-secret-aqui            # Gerar com: openssl rand -hex 32
+# Backup Directory - Path to mounted backup disk
+BACKUP_DIR=/backup
+
+# Airflow Security
+FERNET_KEY="your-fernet-key"          # Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+JWT_SECRET="your-jwt-secret"          # Generate: openssl rand -hex 32
 AIRFLOW_UID=50000
 
-# IPs dos Ambientes oVirt
-DR_MANAGER_IP=10.x.x.x                   # IP do Gerenciador oVirt DR
-PRD_MANAGER_IP=10.x.x.x                  # IP do Gerenciador oVirt Produção
-
-# Diretório de Backup - Caminho para disco de backup montado
-BACKUP_DIR=/backup                       # Alterar se usar ponto de montagem diferente
+# oVirt Environment IPs
+DR_MANAGER_IP="10.x.x.x"             # DR oVirt Manager IP
+PRD_MANAGER_IP="10.x.x.x"            # Production oVirt Manager IP
 ```
 
-### 3. Configuração oVirt
+### 3. oVirt Configuration
 
-Copie e edite o arquivo de variáveis:
+Copy and edit the configuration file:
 ```bash
 cp variables.example.json variables.json
 ```
 
-Edite `variables.json` com suas configurações oVirt:
+Configure your oVirt environments and VM backup policies in `variables.json`:
+
 ```json
 {
-  "source_ovirt_url": "https://manager.exemplo.com/ovirt-engine/api",
+  "source_ovirt_url": "https://manager.example.com/ovirt-engine/api",
   "source_ovirt_user": "admin@internal",
-  "source_ovirt_password": "sua-senha",
+  "source_ovirt_password": "your-password",
   "source_ovirt_cert_path": "/opt/airflow/certs/PRD/ca.pem",
   "backup_directory": "/opt/airflow/backups",
   "checkpoints_file": "/opt/airflow/config/checkpoints.json",
 
-  "target_ovirt_url": "https://dr-manager.exemplo.com/ovirt-engine/api",
+  "target_ovirt_url": "https://dr-manager.example.com/ovirt-engine/api",
   "target_ovirt_user": "admin@internal",
-  "target_ovirt_password": "sua-senha",
+  "target_ovirt_password": "your-password",
   "target_ovirt_cert_path": "/opt/airflow/certs/DR/ca.pem",
 
+  "backup_settings": {
+    "incremental_enabled": true,
+    "max_incremental_chain_length": 10,
+    "force_full_backup_days": 7,
+    "default_backup_time": "02:00"
+  },
+
+  "restore_settings": {
+    "target_cluster_name": "Default",
+    "target_storage_domain_name": "storage-dr",
+    "disk_interface": "SATA",
+    "timeout_minutes": 60,
+    "auto_start_restored_vm": false,
+    "vm_name_suffix": "_restored",
+    "replace_existing_vm": true,
+    "backup_old_vm": true
+  },
+
   "vms_config": {
-    "nome-vm-1": {
-      "backup_policy": "1111111",    # String de 7 bits: 1=backup, 0=pular (Seg-Dom)
-      "retention_days": "7"
-    },
-    "nome-vm-2": {
-      "backup_policy": "1000001",    # Apenas fins de semana
-      "retention_days": "30"
+    "VM_NAME": {
+      "enabled": true,
+      "schedule": {
+        "type": "simple",
+        "pattern": "daily",
+        "time": "02:00"
+      },
+      "backup_type": {
+        "incremental_enabled": true,
+        "full_backup_frequency": "weekly",
+        "full_backup_day": "sunday"
+      },
+      "retention": {
+        "keep_daily": 7,
+        "keep_weekly": 4,
+        "keep_monthly": 3,
+        "max_backup_age_days": 90
+      },
+      "auto_restore": true
     }
   }
 }
 ```
 
-#### Formato da Política de Backup
-- **String de 7 bits**: Cada bit representa um dia da semana (Segunda-Domingo)
-- **1**: Fazer backup neste dia
-- **0**: Pular backup neste dia
-- **Exemplos**:
-  - `"1111111"`: Backups diários
-  - `"1000001"`: Backups apenas nos fins de semana
-  - `"1000000"`: Apenas segunda-feira
+## Backup Configuration
 
-### 4. Configuração de Certificados
+VMs are configured with flexible backup policies supporting both modern structured configuration and legacy formats:
 
-Os certificados SSL do oVirt serão obtidos automaticamente pelas DAGs de gerenciamento:
-```bash
-# Criar diretórios para certificados (serão populados automaticamente)
-mkdir -p certs/PRD
-mkdir -p certs/DR
+### Modern Configuration Format
+
+```json
+{
+  "VM_NAME": {
+    "enabled": true,
+    "schedule": {
+      "type": "simple",           // simple, advanced, cron, custom (legacy)
+      "pattern": "daily",         // daily, weekdays, weekends, weekly, biweekly, monthly
+      "time": "02:00"
+    },
+    "backup_type": {
+      "incremental_enabled": true,
+      "full_backup_frequency": "weekly",
+      "full_backup_day": "sunday"
+    },
+    "retention": {
+      "keep_daily": 7,
+      "keep_weekly": 4,
+      "keep_monthly": 3,
+      "max_backup_age_days": 90
+    },
+    "auto_restore": true
+  }
+}
 ```
 
-**Importante**: Após iniciar os serviços, execute as DAGs de atualização de certificados:
-- `atualizar_certificado_ovirt_producao`: Para obter certificados de produção
-- `atualizar_certificado_ovirt_dr`: Para obter certificados DR
+### Legacy 7-bit Policy Format
 
-### 5. Iniciar Serviços
+```json
+{
+  "VM_NAME": {
+    "enabled": true,
+    "schedule": {
+      "type": "custom",
+      "pattern": "1010101",       // 7-bit string: 1=backup, 0=skip (Monday-Sunday)
+      "time": "22:00"
+    },
+    "backup_type": {
+      "incremental_enabled": true,
+      "full_backup_frequency": "weekly",
+      "full_backup_day": "monday"
+    },
+    "retention": {
+      "keep_daily": 7,
+      "keep_weekly": 4,
+      "keep_monthly": 3,
+      "max_backup_age_days": 90
+    },
+    "auto_restore": true
+  }
+}
+```
+
+### Schedule Types
+
+- **simple**: Common patterns (daily, weekdays, weekends, weekly, biweekly, monthly)
+- **advanced**: Complex monthly patterns (specific days, weeks)
+- **cron**: Direct cron expressions
+- **custom**: Traditional 7-bit string format
+
+### 7-bit Pattern Examples
+- `"1111111"`: Daily backups
+- `"1000001"`: Weekend backups only (Monday + Sunday)
+- `"1000000"`: Monday only
+- `"0000010"`: Saturday only
+
+### Retention Configuration
+
+- **keep_daily**: Number of daily backups to retain
+- **keep_weekly**: Number of weekly backups to retain
+- **keep_monthly**: Number of monthly backups to retain
+- **max_backup_age_days**: Maximum age in days before deletion
+
+## Service Management
+
+### Initial Deployment
 
 ```bash
-# Construir e iniciar todos os serviços
+# Build and start all services
 docker compose up --build -d
 
-# Verificar status dos serviços
+# Check service status
 docker compose ps
 
-# Importar variáveis para o Airflow
-docker compose exec airflow-webserver airflow variables import /opt/airflow/variables.json
-```
-
-### 6. Configurar Certificados Iniciais
-
-Após iniciar os serviços, execute as DAGs para baixar certificados automaticamente:
-
-```bash
-# Disparar DAG para certificados de produção
-docker compose exec airflow-webserver airflow dags trigger atualizar_certificado_ovirt_producao
-
-# Disparar DAG para certificados DR
-docker compose exec airflow-webserver airflow dags trigger atualizar_certificado_ovirt_dr
-```
-
-### 7. Obter Senha do Admin
-
-```bash
-# Obter a senha gerada do admin
+# Get admin password for web interface
 docker compose exec airflow-webserver cat /opt/airflow/simple_auth_manager_passwords.json.generated
 ```
 
-Acesse a interface web em: **http://localhost:8080**
+### Certificate Setup
 
-## Uso dos DAGs
-
-### 1. ovirt_backup_vm
-- **Propósito**: Backups diários automatizados de VMs
-- **Agendamento**: 2:00 AM diariamente
-- **Tipo**: Automático (agendado)
-- **Função**: Faz backup das VMs de acordo com sua política de backup
-
-### 2. ovirt_list_checkpoints
-- **Propósito**: Listar pontos de backup disponíveis para uma VM
-- **Agendamento**: Apenas disparo manual
-- **Configuração**: `{"vm_name": "nome-da-sua-vm"}`
-- **Uso**: Disparar manualmente para ver pontos de restauração disponíveis
-
-### 3. ovirt_restore_specific_checkpoint
-- **Propósito**: Restaurar VM para um checkpoint específico
-- **Agendamento**: Apenas disparo manual
-- **Configuração**: 
-  ```json
-  {
-    "vm_name": "nome-da-sua-vm",
-    "checkpoint_id": 3,
-    "force_restore": false
-  }
-  ```
-- **Uso**: Restaurar para ponto de backup específico
-
-### 4. ovirt_restore_vm
-- **Propósito**: Restaurar VM para o backup mais recente
-- **Agendamento**: Apenas disparo manual
-- **Configuração**: `{"vm_name": "nome-da-sua-vm"}`
-- **Uso**: Restauração rápida para backup mais recente
-
-### 5. DAGs de Gerenciamento de Certificados
-- **atualizar_certificado_ovirt_producao**: Baixa e atualiza automaticamente certificados de produção
-- **atualizar_certificado_ovirt_dr**: Baixa e atualiza automaticamente certificados DR
-- **Agendamento**: Disparo manual (executar após instalação inicial e quando certificados expirarem)
-- **Função**: Eliminam necessidade de configuração manual de certificados
-
-## Comandos de Gerenciamento
-
-### Gerenciamento de Serviços
 ```bash
-# Ver logs
-docker compose logs airflow-webserver
-docker compose logs airflow-scheduler
-
-# Reiniciar serviços
-docker compose restart airflow-scheduler
-docker compose restart airflow-webserver
-
-# Parar todos os serviços
-docker compose down
-
-# Atualizar configuração
-docker compose exec airflow-webserver airflow variables import /opt/airflow/variables.json
+# Certificate directories are created automatically
+# After initial startup, run certificate DAGs to populate them:
+docker compose exec airflow-webserver airflow dags trigger atualizar_certificado_ovirt_producao
+docker compose exec airflow-webserver airflow dags trigger atualizar_certificado_ovirt_dr
 ```
 
-### Operações DAG
+### DAG Development
+
 ```bash
-# Listar todos os DAGs
+# Generate dynamic DAGs from templates
+docker compose exec airflow-webserver airflow dags trigger generate_complete_dynamic_dags
+
+# Test DAG syntax
 docker compose exec airflow-webserver airflow dags list
 
-# Disparar DAG manualmente
-docker compose exec airflow-webserver airflow dags trigger ovirt_backup_vm
+# Trigger specific VM backup DAG
+docker compose exec airflow-webserver airflow dags trigger backup_vm_name
 
-# Ver execuções do DAG
-docker compose exec airflow-webserver airflow dags list-runs -d ovirt_backup_vm
-
-# Testar sintaxe do DAG
-docker compose exec airflow-webserver airflow dags test ovirt_backup_vm 2025-01-01
+# View DAG runs
+docker compose exec airflow-webserver airflow dags list-runs -d backup_vm_name
 ```
 
-## Solução de Problemas
-
-### Limpeza de Processos Zumbi do oVirt
-
-Se encontrar snapshots, discos ou VMs travados no oVirt, execute estes comandos no Engine oVirt:
+### Configuration Management
 
 ```bash
-# Destravar snapshots travados
-/usr/share/ovirt-engine/setup/dbutils/unlock_entity.sh -q -t snapshot
+# Import variables after changes to variables.json
+docker compose exec airflow-webserver airflow variables import /opt/airflow/variables.json
 
-# Destravar discos travados  
-/usr/share/ovirt-engine/setup/dbutils/unlock_entity.sh -q -t disk
-
-# Destravar VMs travadas
-/usr/share/ovirt-engine/setup/dbutils/unlock_entity.sh -q -t vm
-
-# Destravar todas as entidades
-/usr/share/ovirt-engine/setup/dbutils/unlock_entity.sh -t all
+# List current variables
+docker compose exec airflow-webserver airflow variables list
 ```
 
-### Problemas Comuns
+## DAG Architecture
 
-#### 1. Permissão Negada no Diretório de Backup
-```bash
-# Corrigir permissões do diretório de backup
-sudo chown -R 50000:50000 /caminho/para/diretorio/backup
-```
+Each VM gets its own dynamically generated DAG with:
 
-#### 2. Problemas de Certificado
-- Verificar se certificados estão nos diretórios corretos
-- Verificar permissões dos arquivos de certificado
-- Garantir que certificados não estão expirados
+### Backup Tasks
+1. `validate_environment` → Check oVirt connection and VM status
+2. `get_vm_info` → Retrieve VM information and disk details
+3. `check_vm_lock` → Ensure VM is not locked for operations
+4. `create_vm_snapshot` → Create VM snapshot for consistent backup
+5. `backup_vm_disks` → Backup VM disks (full or incremental)
+6. `cleanup_snapshot` → Remove temporary snapshot
 
-#### 3. Problemas de Conexão
-- Verificar conectividade de rede para gerenciadores oVirt
-- Verificar regras de firewall
-- Validar credenciais oVirt em variables.json
+### Restore Tasks (if `auto_restore: true`)
+1. `validate_restore_environment` → Check DR environment readiness
+2. `detect_new_backups` → Identify new backups for restore
+3. `process_vm_restores` → Execute restore operations
 
-#### 4. Problemas de Espaço em Disco
-- Monitorar uso de espaço do diretório de backup
-- Configurar políticas de retenção adequadamente
-- Limpar backups antigos se necessário
-
-#### 5. Erros de Importação DAG
-```bash
-# Verificar sintaxe do DAG
-docker compose exec airflow-webserver python /opt/airflow/dags/nome_do_dag.py
-
-# Atualizar DAGs
-docker compose exec airflow-webserver airflow dags list-import-errors
-```
-
-### Localizações de Log
-- **Logs do Airflow**: `/opt/airflow/logs/` (dentro do container)
-- **Arquivos de Backup**: `${BACKUP_DIR}/` (caminho configurado)
-- **Checkpoints**: `${BACKUP_DIR}/checkpoints.json`
-- **Arquivos de Certificado**: `/opt/airflow/certs/`
-
-## Estrutura de Armazenamento
+## Storage Structure
 
 ```
 ${BACKUP_DIR}/
-├── nome-vm-1/
-│   ├── nome-vm-1_20250101_full.qcow2
-│   ├── nome-vm-1_20250102_incremental.qcow2
+├── vm-name-1/
+│   ├── vm-name-1_20250101_full.qcow2
+│   ├── vm-name-1_20250102_incremental.qcow2
 │   └── ...
-├── nome-vm-2/
+├── vm-name-2/
 │   └── ...
 ├── checkpoints.json
 └── restore_logs/
 ```
 
-## Notas de Segurança
+### Backup Directory Configuration
 
-- Manter credenciais oVirt seguras em variables.json
-- Rotacionar certificados regularmente
-- Monitorar acesso ao diretório de backup
-- Usar segredos Fernet e JWT fortes
-- Restringir acesso de rede apenas às portas necessárias
+The backup directory is fully configurable and designed for a separate disk:
+- **Environment Variable**: `BACKUP_DIR` in `.env` file (default: `/backup`)
+- **Docker Volume**: `${BACKUP_DIR}:/opt/airflow/backups` in docker-compose.yaml
+- **Airflow Variable**: `backup_directory` in variables.json
+- **Recommended Setup**: Mount 1TB+ disk to `/backup` for adequate storage
 
-## Estratégia de Backup
+## Restore Optimization
 
-O sistema suporta:
-- **Backups Completos**: Imagens completas do disco da VM
-- **Backups Incrementais**: Apenas blocos alterados desde o último backup
-- **Cadeias de Backup**: Série de backups incrementais baseados em um backup completo
-- **Múltiplas Cadeias**: Novo backup completo inicia uma nova cadeia
-- **Políticas de Retenção**: Limpeza automática de backups antigos
+The system includes optimized restore functionality that merges incremental backup chains:
 
-Ao restaurar para um checkpoint específico, o sistema automaticamente inclui todos os arquivos necessários da cadeia de backup.
+### Problem Solved
+- **Before**: Restoring incremental chains created multiple full-sized disks (3x storage usage)
+- **After**: Chains are merged into single optimized disk using `qemu-img` operations
+
+### Implementation
+- **Chain Merging**: `merge_backup_chain_complete()` in template merges incrementals
+- **Storage Savings**: Compressed, optimized final disk vs. multiple separate disks
+- **Process**: Copy base → rebase incrementals → commit changes → compress final result
+
+## Troubleshooting
+
+### oVirt Entity Lock Issues
+
+If snapshots, disks, or VMs are locked in oVirt, run these commands on the oVirt Engine:
+
+```bash
+# Unlock locked snapshots
+/usr/share/ovirt-engine/setup/dbutils/unlock_entity.sh -q -t snapshot
+
+# Unlock locked disks
+/usr/share/ovirt-engine/setup/dbutils/unlock_entity.sh -q -t disk
+
+# Unlock locked VMs
+/usr/share/ovirt-engine/setup/dbutils/unlock_entity.sh -q -t vm
+
+# Unlock all entities
+/usr/share/ovirt-engine/setup/dbutils/unlock_entity.sh -t all
+```
+
+### Common Issues
+
+#### Permission Errors
+```bash
+# Fix backup directory permissions
+sudo chown -R 50000:50000 /backup
+```
+
+#### DAG Import Errors
+```bash
+# Check DAG syntax
+docker compose exec airflow-webserver python /opt/airflow/dags/dag_name.py
+
+# List import errors
+docker compose exec airflow-webserver airflow dags list-import-errors
+```
+
+#### Connection Issues
+- Verify network connectivity to oVirt managers
+- Check firewall rules
+- Validate credentials in variables.json
+- Ensure certificates are not expired
+
+### Log Locations
+- **Airflow logs**: `/logs/` directory mapped from container
+- **DAG failures**: Check Airflow web UI → DAGs → specific run
+- **oVirt connection issues**: Verify certificates in `/certs/` and variables.json
+- **Backup failures**: Check disk space in backup directory
+
+## Technical Notes
+
+- Uses **LocalExecutor** (not CeleryExecutor) for simplicity
+- **PostgreSQL** backend for Airflow metadata
+- **Custom Dockerfile** installs oVirt SDK + imageio dependencies
+- **Host networking** for oVirt manager access via extra_hosts
+- **Dynamic DAG Generation** using Jinja2 templates
+- **Optimized Restore Process** with incremental chain merging to reduce storage usage
+- Web interface accessible at **http://localhost:8080**
+
+## Security
+
+- Keep oVirt credentials secure in variables.json
+- Rotate certificates regularly
+- Monitor backup directory access
+- Use strong Fernet and JWT secrets
+- Restrict network access to necessary ports only
+
+## Backup Strategy
+
+The system supports:
+- **Full Backups**: Complete VM disk images
+- **Incremental Backups**: Only changed blocks since last backup
+- **Backup Chains**: Series of incremental backups based on a full backup
+- **Multiple Chains**: New full backup starts a new chain
+- **Retention Policies**: Automatic cleanup of old backups
+
+When restoring to a specific checkpoint, the system automatically includes all necessary files from the backup chain.
