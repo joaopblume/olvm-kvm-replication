@@ -1,0 +1,12 @@
+apache-airflow==3.0.2
+
+ovirt-engine-sdk-python==4.6.2
+ovirt-imageio==2.5.0
+
+pycurl>=7.43.0
+lxml>=4.6.0
+
+requests>=2.25.0
+urllib3>=1.26.0
+
+python-dateutil>=2.8.0

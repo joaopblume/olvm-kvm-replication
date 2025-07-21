@@ -1,0 +1,94 @@
+{
+  "source_ovirt_url": "https://managerurl/ovirt-engine/api",
+  "source_ovirt_user": "admin@internal",
+  "source_ovirt_password": "pwd",
+  "source_ovirt_cert_path": "/opt/airflow/certs/PRD/ca.pem",
+  "backup_directory": "/opt/airflow/backups",
+  "checkpoints_file": "/opt/airflow/config/checkpoints.json",
+
+  "target_ovirt_url": "https://dr-managerurl/ovirt-engine/api",
+  "target_ovirt_user": "admin@internal",
+  "target_ovirt_password": "pwd",
+  "target_ovirt_cert_path": "/opt/airflow/certs/DR/ca.pem",
+
+  "backup_settings": {
+    "incremental_enabled": true,
+    "max_incremental_chain_length": 10,
+    "force_full_backup_days": 7,
+    "default_backup_time": "02:00"
+  },
+
+  "restore_settings": {
+    "target_cluster_name": "Default",
+    "target_storage_domain_name": "storage-dr",
+    "disk_interface": "SATA",
+    "timeout_minutes": 60,
+    "auto_start_restored_vm": false,
+    "vm_name_suffix": "_restored",
+    "replace_existing_vm": true,
+    "backup_old_vm": true
+  },
+
+  "vms_config": {
+    "VM_NAME": {
+      "enabled": true,
+      "schedule": {
+        "type": "simple",
+        "pattern": "daily",
+        "time": "02:00"
+      },
+      "backup_type": {
+        "incremental_enabled": true,
+        "full_backup_frequency": "weekly",
+        "full_backup_day": "sunday"
+      },
+      "retention": {
+        "keep_daily": 7,
+        "keep_weekly": 4,
+        "keep_monthly": 3,
+        "max_backup_age_days": 90
+      },
+      "auto_restore": true
+    },
+    "JAVA_PAINEL": {
+      "enabled": true,
+      "schedule": {
+        "type": "simple",
+        "pattern": "daily",
+        "time": "21:00"
+      },
+      "backup_type": {
+        "incremental_enabled": true,
+        "full_backup_frequency": "weekly",
+        "full_backup_day": "monday"
+      },
+      "retention": {
+        "keep_daily": 7,
+        "keep_weekly": 1,
+        "keep_monthly": 0,
+        "max_backup_age_days": 7
+      },
+      "auto_restore": true
+    },
+    "WSRV_AD_SP": {
+      "enabled": true,
+      "schedule": {
+        "type": "custom",
+        "pattern": "1010101",
+        "time": "22:00"
+      },
+      "backup_type": {
+        "incremental_enabled": true,
+        "full_backup_frequency": "weekly",
+        "full_backup_day": "monday"
+      },
+      "retention": {
+        "keep_daily": 7,
+        "keep_weekly": 4,
+        "keep_monthly": 3,
+        "max_backup_age_days": 90
+      },
+      "auto_restore": true
+    }
+  }
+}

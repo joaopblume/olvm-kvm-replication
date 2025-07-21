@@ -1,0 +1,125 @@
+x-airflow-common: &airflow-common
+  build: .  # Usar Dockerfile personalizado
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__API__BASE_URL: "http://airflow-webserver:8080"
+    AIRFLOW__CORE__INTERNAL_API_URL: "http://airflow-webserver:8080"
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${JWT_SECRET}
+  extra_hosts:
+    - "dr-manager.scisne.local:${DR_MANAGER_IP}"
+    - "manager.scisne.local:${PRD_MANAGER_IP}"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./certs:/opt/airflow/certs
+    - ./config:/opt/airflow/config
+    - ./includes:/opt/airflow/includes
+    - ./variables.json:/opt/airflow/variables.json
+    - ${BACKUP_DIR}:/opt/airflow/backups
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        echo "=== INICIANDO AIRFLOW INIT ==="
+
+        echo "Criando diretórios necessários..."
+        mkdir -p /opt/airflow/backups /opt/airflow/config /opt/airflow/certs/PRD /opt/airflow/certs/DR /opt/airflow/logs
+        
+        echo "Configurando permissões..."
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/backups /opt/airflow/config /opt/airflow/certs /opt/airflow/logs
+
+        echo "Aguardando banco de dados..."
+        airflow db check
+        echo "Migrando banco de dados..."
+        airflow db migrate
+
+        echo "Importando variáveis do Airflow..."
+        if [ -f /opt/airflow/variables.json ]; then
+          airflow variables import /opt/airflow/variables.json
+          echo "✓ Variáveis importadas com sucesso!"
+          
+          echo "Gerando DAGs dinâmicos..."
+          if python3 /opt/airflow/includes/generate_vm_configs.py && python3 /opt/airflow/includes/dynamic_dag_generator.py; then
+            echo "✓ DAGs dinâmicos gerados com sucesso!"
+          else
+            echo "⚠ Falha ao gerar DAGs dinâmicos (será possível gerar via UI)"
+          fi
+        else
+          echo "⚠ Arquivo variables.json não encontrado (opcional)"
+        fi
+
+        echo "=== ✓ INICIALIZAÇÃO CONCLUÍDA COM SUCESSO ==="
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "DagProcessorJob"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-db-volume:
