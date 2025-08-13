@@ -265,91 +265,9 @@ def check_and_unlock_vm(**context):
             'skip_backup': False
         }
 
-def create_vm_snapshot(**context):
-    """Cria snapshot da VM para backup"""
-    lock_check_info = context['task_instance'].xcom_pull(task_ids='check_vm_lock')
-    
-    # Se VM foi desbloqueada, pular backup
-    if lock_check_info.get('skip_backup', False):
-        logging.info(f'Pulando criação de snapshot - VM foi desbloqueada: {lock_check_info.get("unlock_reason", "")}')
-        return {
-            **lock_check_info,
-            'snapshot_skipped': True,
-            'snapshot_skip_reason': lock_check_info.get('unlock_reason', 'VM foi desbloqueada')
-        }
-    
-    vm_id = lock_check_info['vm_id']
-    vm_name = lock_check_info['vm_name']
-    
-    with ovirt_connection() as connection:
-        # Criar snapshot
-        vm_service = connection.system_service().vms_service().vm_service(vm_id)
-        snapshots_service = vm_service.snapshots_service()
-        
-        # Verificar se há snapshots em andamento (pular se houver erro)
-        try:
-            existing_snapshots = snapshots_service.list()
-            for snap in existing_snapshots:
-                if snap.snapshot_status == types.SnapshotStatus.LOCKED:
-                    logging.warning(f'Existe snapshot em andamento para VM {vm_name}: {snap.id}')
-                    # Aguardar snapshot existente terminar antes de criar novo
-                    timeout = 300  # 5 minutos
-                    start_time = time.time()
-                    
-                    while snap.snapshot_status == types.SnapshotStatus.LOCKED:
-                        if time.time() - start_time > timeout:
-                            raise RuntimeError(f'Timeout aguardando snapshot existente após {timeout}s')
-                        logging.info(f'Aguardando snapshot {snap.id} terminar...')
-                        time.sleep(10)
-                        snap = snapshots_service.snapshot_service(snap.id).get()
-                    
-                    logging.info(f'Snapshot existente finalizou: {snap.id} (Status: {snap.snapshot_status})')
-        except Exception as list_error:
-            if "duplicate key" in str(list_error).lower():
-                logging.warning(f'Erro de chave duplicada ao listar snapshots - prosseguindo mesmo assim')
-            else:
-                raise list_error
-        
-        import uuid
-        unique_id = str(uuid.uuid4())[:8]
-        snapshot_description = f"Backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{unique_id}"
-        
-        snapshot = snapshots_service.add(
-            types.Snapshot(
-                description=snapshot_description,
-                persist_memorystate=False  # Não salvar memória (mais rápido)
-            )
-        )
-        
-        logging.info(f'Snapshot criado: {snapshot.id}')
-        
-        # Aguardar snapshot ficar pronto
-        timeout = 300  # 5 minutos
-        start_time = time.time()
-        
-        while True:
-            snapshot = snapshots_service.snapshot_service(snapshot.id).get()
-            
-            if snapshot.snapshot_status == types.SnapshotStatus.OK:
-                logging.info(f'✓ Snapshot pronto: {snapshot.id}')
-                break
-            elif snapshot.snapshot_status == types.SnapshotStatus.LOCKED:
-                if time.time() - start_time > timeout:
-                    raise RuntimeError(f'Timeout criando snapshot após {timeout}s')
-                logging.info('Aguardando snapshot...')
-                time.sleep(10)
-            else:
-                raise RuntimeError(f'Erro no snapshot: {snapshot.snapshot_status}')
-        
-        return {
-            **lock_check_info,
-            'snapshot_id': snapshot.id,
-            'snapshot_description': snapshot_description
-        }
-
 def backup_vm_disks(**context):
     """Realiza backup dos discos da VM (full ou incremental)"""
-    backup_info = context['task_instance'].xcom_pull(task_ids='create_vm_snapshot')
+    backup_info = context['task_instance'].xcom_pull(task_ids='check_vm_lock')
     
     # Se snapshot foi pulado, pular backup também
     if backup_info.get('snapshot_skipped', False):
@@ -475,36 +393,6 @@ def cleanup_snapshot(**context):
     backup_type = backup_info['backup_type']
     
     with ovirt_connection() as connection:
-        # Remover snapshot apenas se foi backup full
-        if backup_type == 'full' and 'snapshot_id' in backup_info:
-            vm_service = connection.system_service().vms_service().vm_service(vm_id)
-            snapshots_service = vm_service.snapshots_service()
-            snapshot_service = snapshots_service.snapshot_service(backup_info['snapshot_id'])
-            
-            # Tentar remover snapshot com retry para VM locked
-            max_retries = 3
-            retry_delay = 60  # 60 segundos
-            
-            for attempt in range(max_retries):
-                try:
-                    snapshot_service.remove()
-                    logging.info(f'✓ Snapshot removido: {backup_info["snapshot_id"]}')
-                    break
-                except Exception as remove_error:
-                    if "VM is locked" in str(remove_error) and attempt < max_retries - 1:
-                        logging.warning(f'VM {vm_name} está bloqueada durante cleanup (tentativa {attempt + 1}/{max_retries})')
-                        logging.info(f'Aguardando {retry_delay}s antes de tentar novamente...')
-                        time.sleep(retry_delay)
-                        retry_delay *= 2  # Backoff exponencial
-                        continue
-                    elif "VM is locked" in str(remove_error):
-                        logging.warning(f'VM {vm_name} ainda bloqueada após {max_retries} tentativas')
-                        logging.warning(f'Snapshot {backup_info["snapshot_id"]} não foi removido, mas backup foi bem-sucedido')
-                        logging.info('Snapshot será limpo automaticamente pelo oVirt ou em próximas execuções')
-                        break
-                    else:
-                        # Outros erros, re-lançar
-                        raise remove_error
         
         # Aplicar política de retenção
         checkpoint_manager = CheckpointManager(OVIRT_CONFIG['backup_dir'])
@@ -1533,12 +1421,6 @@ lock_check_task = PythonOperator(
     dag=dag
 )
 
-snapshot_task = PythonOperator(
-    task_id='create_vm_snapshot',
-    python_callable=create_vm_snapshot,
-    dag=dag
-)
-
 backup_task = PythonOperator(
     task_id='backup_vm_disks',
     python_callable=backup_vm_disks,
@@ -1574,8 +1456,8 @@ process_restores_task = PythonOperator(
 )
 
 # Task dependencies with restore
-validate_task >> vm_info_task >> lock_check_task >> snapshot_task >> backup_task >> cleanup_task >> validate_restore_task >> detect_backups_task >> process_restores_task
+validate_task >> vm_info_task >> lock_check_task >> backup_task >> cleanup_task >> validate_restore_task >> detect_backups_task >> process_restores_task
 {% else %}
 # Task dependencies without restore
-validate_task >> vm_info_task >> lock_check_task >> snapshot_task >> backup_task >> cleanup_task
+validate_task >> vm_info_task >> lock_check_task >> backup_task >> cleanup_task
 {% endif %}
